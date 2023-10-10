@@ -1,0 +1,460 @@
+
+#!/usr/bin/env Rscript
+############################################################################################################################
+# Function: check human S1P related genes expression between UC and HC
+# Data: 8 Oct 2023
+# Author: Shiqiang Sun
+# Run the script in the gearshift cluster
+############################################################################################################################
+
+####################
+# Initialization   #
+####################
+
+# Set seed
+set.seed(1234)
+
+# We will use Seurat version 5
+options(Seurat.object.assay.version = 'v5')
+
+# We need some more memory
+options(future.globals.maxSize = 2000 * 1000 * 1024^2)
+
+# Prevent from automatically converting strings to factors during certain operations
+options(stringsAsFactors = FALSE)
+
+
+####################
+# Libraries        #
+####################
+
+library(Seurat)
+library(ggplot2)
+library(tidyverse)
+
+####################
+# Functions
+####################
+
+# perform MAST as implemented in Seurat
+perform_seurat_mast <- function(seurat_object, identity_column, ident.1, ident.2, min.pct=0.1, assay='RNA', slot='data', features=NULL, logfc_threshold=0.25){
+  # set the identity for the Seurat object
+  Idents(seurat_object) <- identity_column
+  # set the assay
+  DefaultAssay(seurat_object) <- assay
+  # perform MAST
+  mast_result <- FindMarkers(seurat_object, ident.1 = ident.1, ident.2 = ident.2, test.use = 'MAST', assay='RNA', min.pct = min.pct, slot = slot, features = features, logfc.threshold = logfc_threshold)
+  return(mast_result)
+}
+
+# perform MAST as implemented in Seurat, for each cell type
+perform_seurat_mast_per_celltype <- function(seurat_object, identity_column, ident.1, ident.2, mast_output_loc, cell_type_column='cell_type_final', cell_types_to_consider=NULL, min.pct=0.1, assay='RNA', slot='data', features=NULL, logfc_threshold=0.25){
+  # check if the mast output loc exists
+  if(!dir.exists(mast_output_loc)){
+    # create the directory if not
+    dir.create(mast_output_loc, recursive = T)
+  }
+  # check the overlapping cell types
+  cell_types <- unique(seurat_object@meta.data[[cell_type_column]])
+  if(!is.null(cell_types_to_consider)){
+    cell_types <- intersect(cell_types, cell_types_to_consider)
+  }
+  # check each cell type
+  for(cell_type in cell_types){
+    # get a safe file name
+    cell_type_safe <- gsub(' |/', '_', cell_type)
+    cell_type_safe <- gsub('-', '_negative', cell_type_safe)
+    cell_type_safe <- gsub('\\+', '_positive', cell_type_safe)
+    cell_type_safe <- gsub('\\)', '', cell_type_safe)
+    cell_type_safe <- gsub('\\(', '', cell_type_safe)
+    # paste together the output location
+    #full_output_loc <- paste(mast_output_loc, cell_type_safe, '_', ident.1, '_vs_', ident.2, '.tsv', sep = '')
+    full_output_loc <- paste(mast_output_loc, cell_type_safe, '.tsv', sep = '')
+    # subset to the cell type
+    seurat_object_celltype <- seurat_object[, seurat_object@meta.data[[cell_type_column]] == cell_type]
+    # try to do the differential expression (might fail if too few cells)
+    tryCatch(
+      {
+        # perform the analysis
+        mast_result <- perform_seurat_mast(seurat_object_celltype, identity_column, ident.1, ident.2, min.pct, assay, slot = slot, features = features, logfc_threshold = logfc_threshold)
+        # add our only mtc if features were selected. Seurat does Bonferroni correction by multiplying the nominal P-value by the number of genes. when we select the genes to test, this is incorrect.
+        if (!is.null(features) & length(features) > 0) {
+          mast_result[['bonferroni']] <- p.adjust(mast_result[['p_val']], method = 'bonferroni')
+          mast_result[['BH']] <- p.adjust(mast_result[['p_val']], method = 'BH')
+        }
+        # write the result
+        write.table(mast_result, full_output_loc, sep = '\t', row.names = T, col.names = T)
+      },
+      error=function(cond) {
+        # print why we fail
+        print(paste('DE failed for', cell_type, ident.1, 'vs', ident.2, ':', cond))
+      }
+    )
+  }
+}
+
+# create the table which will have the log fold changes (and p values) of the MAST output of the selected genes
+create_lfc_table <- function(mast_output_loc, features){
+  # list all the files
+  files_in_dir <- list.files(mast_output_loc, pattern = '*.tsv')
+  # initialize the full table
+  lfc_table <- NULL
+  # check each file
+  for (output_file in files_in_dir) {
+    # read the output file
+    mast_file <- read.table(paste(mast_output_loc, output_file, sep = ''), sep = '\t', header = T, row.names = 1)
+    # add the genes as a column
+    mast_file[['gene']] <- rownames(mast_file)
+    # extract the cell type from the filename
+    celltype <- gsub('.tsv', '', output_file)
+    # add the celltype as a column
+    mast_file[['celltype']] <- celltype
+    # get the genes that we want, and that we have
+    common_genes <- intersect(features, rownames(mast_file))
+    # subset to only the genes that we are interested in
+    mast_file <- mast_file[common_genes, ]
+    # remove the rownames, as those won't be unique when pasting the cell type together
+    rownames(mast_file) <- NULL
+    # add to the big table
+    if (is.null(lfc_table)) {
+      lfc_table <- mast_file
+    }
+    else{
+      lfc_table <- rbind(lfc_table, mast_file)
+    }
+  }
+  return(lfc_table)
+}
+
+# Create a function to make violin plot for each gene in each cell type
+plot_violin_for_each_cell_type <- function(seurat_object, genes, output_dir) {
+  # get unique cell type
+  cell_types <- unique(seurat_object$cell_type_final)
+  
+  # make sure the output directory exists
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  
+  # Go through for each cell type
+  for (cell_type in cell_types) {
+    # For each cell type, create a new Seurat object containing only the cells of that cell type
+    seurat_subset <- subset(seurat_object, subset = cell_type_final == cell_type)
+    
+    # Violin mapping for each gene
+    for (gene in genes) {
+      # Check whether the gene is present in the dataset
+      if (gene %in% rownames(seurat_subset)) {
+        # create the violin plot
+        p <- VlnPlot(seurat_subset, features = gene, group.by = "disease2")
+        
+        # save plots
+        file_path <- file.path(output_dir, paste0(cell_type, "_", gene, ".pdf"))
+        ggsave(file_path, plot = p, width = 8, height = 8)
+      }
+    }
+  }
+}
+
+####################
+# Main codes       #
+####################
+
+# list of genes for exploration
+genes <- c('S1PR1', 'S1PR2', 'S1PR3', 'S1PR4', 'S1PR5',
+           'SPNS2', 'ABCA1', 'ABCC1', 'ABCG2', 'COL4A3BP',  'PLEKHA8', 'CPTP', 'GLTP',
+           'SPTLC1', 'SPTLC2', 'SPTLC3',
+           'ACER1', 'ACER2', 'ASAH1', 'ASAH2',
+           'SPHK1', 'SPHK2',
+           'SGPP1', 'SGPP2', 'SGPL1', 'PLPP1', 'PLPP2', 'PLPP3',
+           'SGMS1', 'SGMS2') # COL4A3BP is CERT1
+
+# Read vedo2 biopsy Seurat object
+vedo2_biopsy <- readRDS("/groups/umcg-weersma/tmp01/projects/vedopredict2/biopsies/ongoing/cell_type_classification/objects/vedo2_102022_rsct.rds")
+
+# Subset pre-VDZ treatment dataset
+Idents(object = vedo2_biopsy) <- "timepoint"
+vedo2_biopsy_pre <- subset(x = vedo2_biopsy, idents = "T0")
+
+# Add a tag in metadata to mark vedo2 dataset
+vedo2_biopsy_pre$dataset <- "vedo2"
+vedo2_biopsy_pre$disease <- "UC"
+
+# Subset vedo2 dataset
+vedo2_biopsy_pre@meta.data <- vedo2_biopsy_pre@meta.data[,c("orig.ident", "nCount_RNA", "nFeature_RNA", "nCount_HTO", "nFeature_HTO",
+                                                            "HTO_maxID", "HTO_secondID", "HTO_margin", "HTO_classification", 
+                                                            "HTO_classification.global", "hash.ID", "Final_HTO", "Final_HTO_status",
+                                                            "percent.mt", "lane", "nCount_SCT", "seurat_clusters", "disease", 
+                                                            "inflammation", "sample", "compartment", "cell_type_final", "dataset")]
+
+# Read PSC-IBD project 
+PSC_IBD <- readRDS("/groups/umcg-weersma/tmp01/projects/PSC/ongoing/Seurat_object/PSC_colitis_allcomps_mergedcelltypes.rds")
+
+# Add a tag in metadata to mark shared dataset from lpmcv2 project
+PSC_IBD$dataset <- "PSC_IBD"
+
+PSC_IBD@meta.data <- PSC_IBD@meta.data[,c("orig.ident", "nCount_RNA", "nFeature_RNA", "nCount_HTO", "nFeature_HTO",
+                                          "HTO_maxID", "HTO_secondID", "HTO_margin", "HTO_classification", 
+                                          "HTO_classification.global", "hash.ID", "Final_HTO", "Final_HTO_status",
+                                          "percent.mt", "lane", "nCount_SCT", "seurat_clusters", "disease", 
+                                          "inflammation", "sample", "compartment", "mergedcelltype", "dataset")]
+
+colnames(PSC_IBD@meta.data)[which(names(PSC_IBD@meta.data) == "mergedcelltype")] <- "cell_type_final"
+
+# Merge two dataset
+dataset_combined <- merge(vedo2_biopsy_pre, PSC_IBD, merge.data = TRUE)
+
+# Normalizing the data
+dataset_combined <- SCTransform(dataset_combined, vars.to.regress = c("percent.mt"))
+
+# Run PCA
+dataset_combined <- RunPCA(dataset_combined, verbose = FALSE)
+
+# Cluster the cells
+dataset_combined <- FindNeighbors(dataset_combined, dims = 1:30)
+dataset_combined <- FindClusters(dataset_combined, resolution = 1.2)
+
+# Run UMAP
+dataset_combined <- RunUMAP(dataset_combined, dims = 1:30)
+
+#  Save the combined dataset
+saveRDS(dataset_combined, file = "/groups/umcg-weersma/tmp01/Moting/sphingosine_gene_expression/UC_vs_HC/Seurat_object/vedo2_pre_PSC_IBD_combined_noNorma.rds")
+
+# Set DefaultAssay as RNA
+DefaultAssay(dataset_combined) <- "RNA"
+
+# add the bulk column
+dataset_combined@meta.data[['bulk']] <- 'bulk'
+
+# Create a new column that is disease2
+dataset_combined$disease2 <- ifelse(dataset_combined$disease == "HC", "HC", "UC")
+
+# The depository for gene list
+gene_output_DE_loc <- "/groups/umcg-weersma/tmp01/Moting/sphingosine_gene_expression/UC_vs_HC/vedo2_PSC_IBD_combined/gene_list/"
+
+# perform differential expression at the bulk level
+perform_seurat_mast_per_celltype(dataset_combined, identity_column = 'disease2', cell_type_column = 'bulk',  mast_output_loc = gene_output_DE_loc, ident.1 = 'UC', ident.2 = 'HC', features = genes, min.pct = 0, logfc_threshold = 0)
+
+# now for each cell type
+perform_seurat_mast_per_celltype(dataset_combined, identity_column = 'disease2', cell_type_column = 'cell_type_final',  mast_output_loc = gene_output_DE_loc, ident.1 = 'UC', ident.2 = 'HC', features = genes, min.pct = 0, logfc_threshold = 0)
+
+# get the lfc table
+gene_lfc_UC_vs_HC <- create_lfc_table(gene_output_DE_loc, features = genes)
+
+# Back to orignal names
+gene_lfc_UC_vs_HC$celltype <- gsub('_', ' ', gene_lfc_UC_vs_HC$celltype)
+gene_lfc_UC_vs_HC$celltype <- gsub('positive', '+', gene_lfc_UC_vs_HC$celltype)
+gene_lfc_UC_vs_HC$celltype <- gsub('negative', '-', gene_lfc_UC_vs_HC$celltype)
+
+gene_lfc_UC_vs_HC$disease <- ifelse(gene_lfc_UC_vs_HC$avg_log2FC > 0, "UC", "HC")
+
+# filter BH < 0.05
+gene_lfc_UC_vs_HC_0.05 <- filter(gene_lfc_UC_vs_HC, gene_lfc_UC_vs_HC$BH < 0.05)
+
+# write files
+write.csv(gene_lfc_UC_vs_HC_0.05, paste(gene_output_DE_loc,"gene_lfc_UC_vs_HC_0.05.csv", sep = ""), row.names = F)
+write.csv(gene_lfc_UC_vs_HC, paste(gene_output_DE_loc,"gene_lfc_UC_vs_HC.csv", sep = ""), row.names = F)
+
+
+# Order cell types and genes
+celltype_levels_0.05 <- c(
+  "bulk", "IgM", "IgG", "IgA", "Glia", "Post -capillary Venules", 
+  "Endothelial", "WNT2B + Fos -lo 1", "WNT2B + Fos -hi",
+  "DUOX2 enterocytes", "Enteroendocrine", "Goblet", "Best4 + Enterocytes", 
+  "Enterocytes", "Enterocyte Progenitors", "Immature Enterocytes 2", 
+  "Immature Enterocytes 1", "Cycling TA", "TA 2", "TA 1", "Stem")
+
+celltype_levels <- c(
+  "bulk", "Tregs", "CD4 + Memory", "CD4 + Activated Fos -lo", "CD4 + Activated Fos -hi", "CD8 + IL17 +",
+  "CD8 + LP", "CD8 + IELs", "ILCs", "NKs", "Cycling T", "Inflammatory Monocytes", "Cycling Monocytes",
+  "CD69 + Mast", "DC2", "DC1", "Macrophages", "Cycling B", "GC", "Follicular", "IgM", "IgG", "IgA",
+  "Glia", "Pericytes", "Post -capillary Venules", "Microvascular", "Endothelial", "Myofibroblasts",
+  "WNT5B + 2", "WNT5B + 1", "RSPO3 +", "WNT2B + Fos -lo 2", "WNT2B + Fos -lo 1", "WNT2B + Fos -hi",
+  "DUOX2 enterocytes", "Enteroendocrine", "Tuft", "Goblet", "Immature Goblet", "Secretory TA",
+  "Best4 + Enterocytes", "M cells", "Enterocytes", "Enterocyte Progenitors", "Immature Enterocytes 2",
+  "Immature Enterocytes 1", "Cycling TA", "TA 2", "TA 1", "Stem"
+)
+
+gene_levels <- c(
+  'S1PR1', 'S1PR2', 'S1PR3', 'S1PR4', 'S1PR5', 'SPNS2', 'ABCA1', 'ABCC1', 'ABCG2',
+  'COL4A3BP', 'PLEKHA8', 'CPTP', 'GLTP', 'SPTLC1', 'SPTLC2', 'SPTLC3', 'ACER1',
+  'ACER2', 'ASAH1', 'ASAH2', 'SPHK1', 'SPHK2', 'SGPP1', 'SGPP2', 'SGPL1', 'PLPP1',
+  'PLPP2', 'PLPP3', 'SGMS1', 'SGMS2'
+)
+
+######################################## make the heatmap for significant change results ########################################
+
+gene_lfc_UC_vs_HC_0.05 <- gene_lfc_UC_vs_HC_0.05 %>%
+  mutate(
+    gene = factor(gene, levels = gene_levels),
+    celltype = factor(celltype, levels = celltype_levels)
+  )
+
+# The depository for plots
+gene_output_heatmap_plot_loc <- "/groups/umcg-weersma/tmp01/Moting/sphingosine_gene_expression/UC_vs_HC/vedo2_PSC_IBD_combined/plots/heatmaps/"
+
+breaks1 <- c( -0.4, -0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3, 0.4)
+gene_lfc_UC_vs_HC_0.05$group <- cut(gene_lfc_UC_vs_HC_0.05$avg_log2FC, breaks = breaks1)
+colors1 <- c(
+  '#eb5252', # (-0.4,-0.3]
+  '#ed6f6f', # (-0.3,-0.2]
+  '#f09797', # (-0.2,-0.1]
+  '#f0c9c9', # (-0.1,0]
+  
+  '#CCE6FF', #(0,0.1]
+  '#80baf2', #(0.1,0.2]
+  '#4698e8', #(0.2,0.3]
+  '#1581ed' #(0.3,0.4]
+)
+
+# Plot for significant results
+plot1 <- gene_lfc_UC_vs_HC_0.05 %>% 
+  ggplot(aes(x = gene, y = celltype, fill = factor(group))) +
+  coord_fixed(ratio = 1) +
+  geom_tile() +
+  scale_fill_manual(
+    breaks = levels(gene_lfc_UC_vs_HC_0.05$group),
+    values = colors1
+  ) +
+  ggtitle('')  +
+  geom_tile(colour = 'white') +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(y = NULL, x = NULL) +
+  guides(fill = guide_legend(title = "log2 fold change")) +
+  theme(panel.border = element_rect(color = "black", fill = NA, size = 1.1), 
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        panel.background = element_blank(), strip.background = element_rect(colour = "white", fill = "white"),
+        legend.spacing.y = unit(0.5, 'cm'))
+
+# Save the plot
+ggsave(filename = "UC_vs_HC_0.05.pdf", plot = plot1, width = 10, height = 10, path = gene_output_heatmap_plot_loc)
+
+# I want to change color with NA as grey
+
+# Create a new dataframe containing all possible combinations of genes and cell types
+complete_data_0.05 <- expand.grid(
+  gene = unique(gene_lfc_UC_vs_HC_0.05$gene),
+  celltype = unique(gene_lfc_UC_vs_HC_0.05$celltype)
+)
+
+# merge new dataframe and old data
+complete_data_0.05 <- left_join(complete_data_0.05, gene_lfc_UC_vs_HC_0.05, by = c("gene", "celltype")) %>%
+  mutate(group = as.character(group)) %>%
+  replace_na(list(group = "NA")) %>%
+  mutate(
+    gene = factor(gene, levels = gene_levels),
+    celltype = factor(celltype, levels = celltype_levels)
+  )
+
+# Plot
+plot2 <- complete_data_0.05 %>%
+  ggplot(aes(x = gene, y = celltype, fill = factor(group))) +
+  coord_fixed(ratio = 1) +
+  geom_tile(colour = 'white') +  # add white grid
+  scale_fill_manual(
+    breaks = c("Missing", levels(gene_lfc_UC_vs_HC_0.05$group)),
+    values = c("grey", colors1)  # the color of NA as grey
+  ) +
+  ggtitle('') +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(y = NULL, x = NULL) +
+  guides(fill = guide_legend(title = "log2 fold change")) +
+  theme(panel.border = element_rect(color = "black", fill = NA, size = 1.1),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        strip.background = element_rect(colour = "white", fill = "white"),
+        legend.spacing.y = unit(0.5, 'cm'))
+
+# Save the plot
+ggsave(filename = "UC_vs_HC_0.05_2.pdf", plot = plot2, width = 10, height = 10, path = gene_output_heatmap_plot_loc)
+
+
+######################################## make the heatmap for all change results ########################################
+
+gene_lfc_UC_vs_HC <- gene_lfc_UC_vs_HC %>%
+  mutate(
+    gene = factor(gene, levels = gene_levels),
+    celltype = factor(celltype, levels = celltype_levels)
+  )
+
+breaks2 <- c( -0.9, -0.8, -0.7, -0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+gene_lfc_UC_vs_HC$group <- cut(gene_lfc_UC_vs_HC$avg_log2FC, breaks = breaks2)
+colors2 <- c(
+  '#9c0303', # (-0.9,-0.8]
+  '#c90000', # (-0.8,-0.7]
+  '#e60e0e', # (-0.7,-0.6]
+  '#e62525', # (-0.6,-0.5]
+  '#eb3d3d', # (-0.5,-0.4]
+  '#eb5252', # (-0.4,-0.3]
+  '#ed6f6f', # (-0.3,-0.2]
+  '#f09797', # (-0.2,-0.1]
+  '#f0c9c9', # (-0.1,0]
+  
+  '#CCE6FF', #(0,0.1]
+  '#80baf2', #(0.1,0.2]
+  '#4698e8', #(0.2,0.3]
+  '#1581ed', #(0.3,0.4]
+  '#027cf5', #(0.4,0.5]
+  '#0269cf', #(0.5,0.6]
+  '#0257ab', #(0.6,0.7]
+  '#01468a', #(0.7,0.8]
+  '#013569' #(0.8,0.9]
+)
+
+plot3 <- gene_lfc_UC_vs_HC %>% 
+  ggplot(aes(x = gene, y = celltype, fill = factor(group))) +
+  coord_fixed(ratio = 1) +
+  geom_tile() +
+  scale_fill_manual(
+    breaks = levels(gene_lfc_UC_vs_HC$group),
+    values = colors2
+  ) +
+  ggtitle('')  +
+  geom_tile(colour = 'white') +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(y = NULL, x = NULL) +
+  guides(fill = guide_legend(title = "log2 fold change")) +
+  theme(panel.border = element_rect(color = "black", fill = NA, size = 1.1), 
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        panel.background = element_blank(), strip.background = element_rect(colour = "white", fill = "white"),
+        legend.spacing.y = unit(0.5, 'cm'))
+
+# Save the plot
+ggsave(filename = "UC_vs_HC.pdf", plot = plot3, width = 10, height = 15, path = gene_output_heatmap_plot_loc)
+
+
+######################################## make the dotplot plot for all change results ########################################
+
+
+plot_dotplot_for_each_cell_type <- function(seurat_object, genes, output_dir) {
+  # get unique cell type
+  cell_types <- unique(seurat_object$cell_type_final)
+  
+  # make sure the output directory exists
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  
+  # Go through for each cell type
+  for (cell_type in cell_types) {
+    # For each cell type, create a new Seurat object containing only the cells of that cell type
+    seurat_subset <- subset(seurat_object, subset = cell_type_final == cell_type)
+    
+    # Dotplot mapping for genes in each cell type
+    p <- DotPlot(seurat_subset, features = genes, group.by = "disease2") +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+    # save plots
+    file_path <- file.path(output_dir, paste0(cell_type, ".pdf"))
+    ggsave(file_path, plot = p, width = 15, height = 6)
+  }
+}
+
+gene_output_dotplot_plot_loc <- "/groups/umcg-weersma/tmp01/Moting/sphingosine_gene_expression/UC_vs_HC/vedo2_PSC_IBD_combined/plots/dotplots/"
+plot_dotplot_for_each_cell_type(seurat_object = dataset_combined, genes = genes, output_dir = gene_output_dotplot_plot_loc)
+
+
+######################################## make the violin plot for all change results ########################################
+
+gene_output_violin_plot_loc <- "/groups/umcg-weersma/tmp01/Moting/sphingosine_gene_expression/UC_vs_HC/vedo2_PSC_IBD_combined/plots/violin_plots/"
+plot_violin_for_each_cell_type(seurat_object = dataset_combined, genes = genes, output_dir = gene_output_violin_plot_loc)
